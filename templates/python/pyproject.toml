@@ -1,0 +1,66 @@
+# Software-factory Python baseline. Merge into your pyproject.toml.
+# Replace `yourpkg` with your package name.
+[project]
+name = "yourpkg"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "hypothesis>=6",
+  "mypy>=1.10",
+  "ruff>=0.5",
+  "mutmut>=3",
+  "import-linter>=2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Correctness-oriented rule set: bugs, bad exception handling, simplifications.
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "BLE", "TRY", "PT", "S", "C4", "PIE", "RET", "ARG"]
+ignore = ["TRY003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "ARG"]
+
+[tool.mypy]
+strict = true
+warn_unreachable = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["tests"]
+xfail_strict = true
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["src"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+
+[tool.mutmut]
+paths_to_mutate = ["src/"]
+
+# Architecture rules: adapt to your layers.
+[tool.importlinter]
+root_package = "yourpkg"
+
+[[tool.importlinter.contracts]]
+name = "domain does not depend on adapters"
+type = "forbidden"
+source_modules = ["yourpkg.domain"]
+forbidden_modules = ["yourpkg.adapters"]

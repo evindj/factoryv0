@@ -1,0 +1,17 @@
+{
+  "name": "software-factory",
+  "version": "0.1.0",
+  "description": "Verification-first software factory for Java and Python: spec -> verification design -> optional formal spec -> TDD -> evidence, enforced by hooks.",
+  "author": {
+    "name": "innocent"
+  },
+  "keywords": [
+    "tdd",
+    "verification",
+    "specs",
+    "tla+",
+    "java",
+    "python"
+  ],
+  "license": "MIT"
+}

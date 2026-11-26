@@ -1,0 +1,7 @@
+{
+  "name": "software-factory",
+  "owner": { "name": "innocent" },
+  "plugins": [
+    { "name": "software-factory", "source": "./", "description": "Verification-first software factory for Java and Python." }
+  ]
+}

@@ -1,0 +1,17 @@
+<!-- software-factory -->
+## Software factory workflow (enforced by hooks)
+
+This project uses the `software-factory` plugin. Feature work always goes through:
+
+1. **Spec**: `docs/specs/NNNN-slug/spec.md` with testable acceptance criteria. Approved by the human.
+2. **Verification design**: `verification.md`. Brainstorm *every* way each criterion will be proven, then do an adversarial "how could this be wrong and still pass?" pass. Approved by the human.
+3. **Formal spec** (when verification.md says `formal: required`): TLA+/Alloy in `formal/`, model-checked by `.factory/factory model-check`.
+4. **TDD**: each V-row becomes an executable check that is seen failing (`.factory/factory record-red V-NN "<cmd>"`), then passing.
+5. **Evidence**: `evidence.md` maps every V-row to proof. `.factory/factory evidence` must pass.
+
+Rules:
+- Production code is blocked until spec.md and verification.md are approved. Tests, docs and specs are always editable.
+- You never approve your own work. Ask the user to run `! .factory/factory approve spec` (or `verification`).
+- Never weaken a check to make it pass (skipping tests, lowering types, `# type: ignore`, `@Disabled`, deleting assertions) without the user's explicit agreement, which is recorded in evidence.md as ACCEPTED-RISK.
+- `.factory/factory status` shows where the active feature stands. `.factory/factory gate` runs all static checks and tests.
+- Use the `factory` skill to drive the whole flow.

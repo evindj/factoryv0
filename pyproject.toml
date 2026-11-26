@@ -1,0 +1,26 @@
+# Dev config for the software-factory plugin itself (the plugin's runtime is stdlib-only python3).
+[project]
+name = "software-factory"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[dependency-groups]
+dev = ["pytest>=8", "hypothesis>=6", "mypy>=1.10", "ruff>=0.5"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["fixtures", "templates"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "BLE", "PT", "C4", "RET"]
+
+[tool.mypy]
+strict = true
+files = ["scripts", "tests"]
+mypy_path = "scripts"
+exclude = ["fixtures/", "templates/"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers -p no:cacheprovider"
+testpaths = ["tests"]
