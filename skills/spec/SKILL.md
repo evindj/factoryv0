@@ -14,7 +14,7 @@ Goal: a short spec whose acceptance criteria are precise enough that verificatio
    - **Scope / non-goals**: non-goals prevent scope creep later. Be explicit.
    - **Acceptance criteria** `AC-n`: each one observable from outside the unit (input → output, state change, message, log/metric). Avoid "works correctly", "fast", "robust". Quantify instead: "p99 < 50 ms at 1k rps", "rejects payloads > 1 MiB with error X".
    - **Constraints**: compatibility, performance, security, environments.
-   - **Design sketch**: components, state and failure modes. Just enough for stage 2 to reason about.
+   - **Context & failure model**: actors, existing systems, and what can fail (dependencies down, messages lost or duplicated, crashes), with what the user must observe then. Requirements only; the solution is worked out in the design phases after verification.
    - **Open questions**: ask the user (AskUserQuestion) rather than guessing. Each one must be resolved or explicitly deferred.
 4. Self-check before asking for approval:
    - Could two engineers read each AC and write the same test?

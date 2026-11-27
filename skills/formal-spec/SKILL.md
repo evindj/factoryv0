@@ -1,9 +1,9 @@
 ---
 name: formal-spec
-description: Stage 2b of the software factory. Write and model-check a formal specification (TLA+/PlusCal by default, Alloy for data-model invariants) of key design aspects such as distributed protocols, concurrency, retries/idempotency or complex state machines, then link each property to code-level checks. Use when verification.md has formal: required.
+description: Stage 3e of the software factory. Write and model-check a formal specification (TLA+/PlusCal by default, Alloy for data-model invariants) of key design aspects such as distributed protocols, concurrency, retries/idempotency or complex state machines, then link each property to code-level checks. Use when design/architecture.md has formal: required.
 ---
 
-# Stage 2b: Formal specification
+# Stage 3e: Formal specification
 
 Use this when tests alone can't give confidence because the space of interleavings, failures or states is too large to enumerate by hand. Model the **design**, not the code. Keep it small enough to model-check in minutes.
 
@@ -15,16 +15,16 @@ Run `.factory/factory stage formal`. Delegate the heavy lifting to the `spec-mod
    - Alloy: structural invariants over relations (permissions models, schemas, graph shapes).
    - Start from `${CLAUDE_PLUGIN_ROOT}/templates/formal/`.
 2. **Write the spec** in `docs/specs/NNNN-slug/formal/<Name>.tla` plus `<Name>.cfg`:
-   - State variables mirror the design sketch in spec.md.
+   - State variables mirror the components and state in design/architecture.md (and the entities in design/data.md).
    - Model the **environment** explicitly: message loss, duplication and reordering, crashes and restarts, clock skew. Only include what the spec's failure model admits, and say so in a comment.
    - Define a `TypeOK` invariant, then the **safety** invariants (e.g. `AtMostOneLeaderPerTerm`, `NoLostAcknowledgedWrite`), then the **liveness** properties under explicit fairness (e.g. `<>[] AllRequestsAnswered`).
    - Choose model bounds in the .cfg (e.g. 3 nodes, 2 terms, 3 messages) and write *why these bounds are enough* in a comment at the top of the spec. Typical reason: small-scope hypothesis plus which bug classes need N ≥ 3.
 3. **Model-check:** `.factory/factory model-check docs/specs/NNNN-slug/formal/<Name>.tla`. This writes `<Name>.model-check.log` with a sha256 of the spec. Editing the spec afterwards invalidates the result.
-   - Counterexample → read the trace, decide whether the *design* or the *spec* is wrong, fix it, and re-run. If the design changed, update spec.md/verification.md and get re-approval.
+   - Counterexample → read the trace, decide whether the *design* or the *spec* is wrong, fix it, and re-run. If the design is wrong, loop back: `.factory/factory revise architecture --from formal "<counterexample summary>"` (or `data` for data invariants), fix the doc, and get re-approval, then re-confirmation of the later docs.
    - **Sanity check (vacuity):** a spec that can't fail proves nothing. Add a probe `.cfg` whose INVARIANT claims a state you expect to reach is unreachable (e.g. `ProbeNeverAcked == acked = {}`). Run `.factory/factory model-check <Name>.tla --config <Probe>.cfg --expect-violation ProbeNeverAcked`; it passes only if TLC finds the trace. For liveness, confirm the property fails when you remove the fairness assumption it depends on.
    - Keep the probe and seeded-bug configs. Each run writes `<Name>.<Cfg>.model-check.log`, and all of them must pass and match the current spec.
    - Real example: in `fixtures/formal-sample/Dedup.tla` TLC found that the first "fixed" design acknowledged a duplicate while the original was still being applied (`AckedImpliesApplied`, a 7-step trace). Unit tests had encoded that behaviour as correct.
-4. **Link spec to code.** Add V-rows to verification.md (this needs re-approval) for:
+4. **Link spec to code.** Add `DC-ARCH-NN` rows (dimension `formal`) to design/architecture.md for the items below. This is a change to an approved doc, so open a revision first (`revise architecture --from formal "link model properties"`).
    - each invariant → a property-based / stateful test (Hypothesis `RuleBasedStateMachine`, jqwik actions) that checks the same predicate on the implementation, plus a cheap runtime assertion where sensible;
    - each counterexample TLC found → a deterministic regression test that replays that interleaving;
    - fault injection matching the modelled environment (Testcontainers + Toxiproxy: partitions, latency, drops);

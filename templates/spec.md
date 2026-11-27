@@ -25,8 +25,8 @@ feature: {{feature}}
 <!-- Interfaces that must not break, performance budgets, security, platforms, dependencies. -->
 -
 
-## Design sketch
-<!-- Just enough to design verification against: components, data flow, state, failure modes. -->
+## Context & failure model
+<!-- Requirements-level only: actors, existing systems, what can fail (dependencies down, messages lost/duplicated, crashes) and what the user must see then. The solution goes in design/. -->
 
 ## Open questions
 <!-- Every question must be answered or explicitly deferred before approval. -->

@@ -1,7 +1,7 @@
 {
   "name": "software-factory",
-  "version": "0.1.0",
-  "description": "Verification-first software factory for Java and Python: spec -> verification design -> optional formal spec -> TDD -> evidence, enforced by hooks.",
+  "version": "0.2.0",
+  "description": "Verification-first software factory for Java and Python: spec -> verification design -> architecture/resiliency, API, data and OO design -> optional formal spec -> TDD -> evidence, every stage gated and enforced by hooks.",
   "author": {
     "name": "innocent"
   },

@@ -1,0 +1,2 @@
+-- Target schema for the data design phase. Copy to docs/specs/NNNN-slug/design/data/schema.sql.
+-- This is the approved end state; migrations must produce exactly this (checked by a DC-DATA row).

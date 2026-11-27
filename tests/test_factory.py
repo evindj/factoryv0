@@ -61,13 +61,44 @@ def py_project(tmp_path: Path) -> Path:
     return root
 
 
-def approve_all(root: Path, formal: str = "not-needed") -> Path:
+def set_frontmatter(doc: Path, **values: str) -> None:
+    """Replace `key: ...` lines inside the frontmatter of doc."""
+    head, sep, body = doc.read_text().partition("\n---\n")
+    lines = head.splitlines()
+    for key, value in values.items():
+        lines = [f"{key}: {value}" if ln.startswith(f"{key}:") else ln for ln in lines]
+        if not any(ln.startswith(f"{key}:") for ln in lines):
+            lines.append(f"{key}: {value}")
+    doc.write_text("\n".join(lines) + sep + body)
+
+
+def new_feature(root: Path) -> Path:
     assert run_cli(root, "new", "dedup").returncode == 0
-    spec_dir = root / factory.State.load(root).active  # type: ignore[operator]
-    ver = spec_dir / "verification.md"
-    ver.write_text(ver.read_text().replace("formal: undecided", f"formal: {formal}"))
-    assert run_cli(root, "approve", "spec").returncode == 0
-    assert run_cli(root, "approve", "verification").returncode == 0
+    return root / factory.State.load(root).active  # type: ignore[operator]
+
+
+def fill_design(spec_dir: Path, formal: str = "not-needed") -> None:
+    """Architecture + OO apply (template DC rows), API + data are n/a."""
+    d = spec_dir / "design"
+    set_frontmatter(d / "architecture.md", applies="yes", formal=formal)
+    set_frontmatter(d / "api.md", applies="no", reason="pure library, no new interface")
+    set_frontmatter(d / "data.md", applies="no", reason="no persistence")
+    set_frontmatter(d / "oo.md", applies="yes")
+
+
+def approve(root: Path, *docs: str) -> None:
+    for doc in docs:
+        r = run_cli(root, "approve", *doc.split())
+        assert r.returncode == 0, r.stderr
+
+
+CHAIN = ("spec", "verification", "architecture", "api", "data", "oo")
+
+
+def approve_all(root: Path, formal: str = "not-needed") -> Path:
+    spec_dir = new_feature(root)
+    fill_design(spec_dir, formal)
+    approve(root, *CHAIN)
     return spec_dir
 
 
@@ -125,17 +156,203 @@ def test_guard_allows_tests_and_docs_anytime(py_project: Path) -> None:
     assert hook("pre", py_project, edit(py_project, "docs/notes.md")).returncode == 0
 
 
-def test_guard_requires_both_approvals_and_formal_decision(py_project: Path) -> None:
-    run_cli(py_project, "new", "dedup")
+def test_guard_requires_every_approval_in_the_chain(py_project: Path) -> None:
+    spec_dir = new_feature(py_project)
+    fill_design(spec_dir)
     target = edit(py_project, "src/sample/dedup.py")
-    run_cli(py_project, "approve", "spec")
+    for i, doc in enumerate(CHAIN):
+        r = hook("pre", py_project, target)
+        assert r.returncode == 2
+        assert f"{factory.DOC_NAMES[doc]} has not been approved" in r.stderr
+        approve(py_project, doc)
+        assert i < len(CHAIN) - 1 or hook("pre", py_project, target).returncode == 0
+
+
+def test_approval_order_is_enforced(py_project: Path) -> None:
+    spec_dir = new_feature(py_project)
+    fill_design(spec_dir)
+    approve(py_project, "spec", "verification")
+    r = run_cli(py_project, "approve", "api")
+    assert r.returncode != 0
+    assert "approve the earlier documents first" in r.stderr
+    assert "architecture.md has not been approved" in r.stderr
+    assert not factory.is_approved(py_project, spec_dir / "design/api.md")[0]
+
+
+def test_unknown_doc_is_refused(py_project: Path) -> None:
+    new_feature(py_project)
+    assert run_cli(py_project, "approve", "evidence").returncode != 0
+
+
+@pytest.mark.parametrize(
+    ("doc", "frontmatter", "message"),
+    [
+        ("architecture", {"applies": "undecided"}, "`applies:` must be `yes` or `no`"),
+        ("architecture", {"formal": "undecided"}, "`formal:` must be `required` or `not-needed`"),
+        ("api", {"applies": "no", "reason": ""}, "gives no `reason:`"),
+        ("api", {"applies": "yes"}, "artifact design/api/openapi.yaml does not exist"),
+        ("api", {"applies": "yes", "artifacts": ""}, "declares no `artifacts:`"),
+        ("data", {"applies": "yes"}, "artifact design/data/schema.sql does not exist"),
+    ],
+)
+def test_design_doc_must_be_complete_before_approval(
+    py_project: Path, doc: str, frontmatter: dict[str, str], message: str
+) -> None:
+    spec_dir = new_feature(py_project)
+    fill_design(spec_dir)
+    set_frontmatter(spec_dir / factory.DOC_NAMES[doc], **frontmatter)
+    for earlier in CHAIN[: CHAIN.index(doc)]:
+        approve(py_project, earlier)
+    r = run_cli(py_project, "approve", doc)
+    assert r.returncode != 0
+    assert message in r.stderr
+
+
+def test_oo_needs_an_architecture_rule_row(py_project: Path) -> None:
+    spec_dir = new_feature(py_project)
+    fill_design(spec_dir)
+    oo = spec_dir / "design/oo.md"
+    oo.write_text(
+        oo.read_text().replace("| DC-OO-01 | D-OO-1   | architecture |", "| DC-OO-01 | D-OO-1   | functional |")
+    )
+    approve(py_project, *CHAIN[:-1])
+    r = run_cli(py_project, "approve", "oo")
+    assert r.returncode != 0
+    assert "dimension `architecture`" in r.stderr
+
+
+def test_applicable_design_doc_needs_dc_rows(py_project: Path) -> None:
+    spec_dir = new_feature(py_project)
+    fill_design(spec_dir)
+    arch = spec_dir / "design/architecture.md"
+    arch.write_text(arch.read_text().replace("| DC-ARCH-01 |", "| todo |"))
+    approve(py_project, "spec", "verification")
+    r = run_cli(py_project, "approve", "architecture")
+    assert r.returncode != 0
+    assert "no DC-* design-conformance rows" in r.stderr
+
+
+@pytest.mark.parametrize("as_dir", [False, True])
+def test_editing_api_artifact_invalidates_approval(py_project: Path, as_dir: bool) -> None:
+    spec_dir = new_feature(py_project)
+    fill_design(spec_dir)
+    art_dir = spec_dir / "design/api"
+    art_dir.mkdir()
+    (art_dir / "openapi.yaml").write_text("openapi: 3.1.0\n")
+    set_frontmatter(
+        spec_dir / "design/api.md", applies="yes", artifacts="design/api" if as_dir else "design/api/openapi.yaml"
+    )
+    approve(py_project, *CHAIN)
+    target = edit(py_project, "src/sample/dedup.py")
+    assert hook("pre", py_project, target).returncode == 0
+    (art_dir / "openapi.yaml").write_text("openapi: 3.1.0\npaths: {}\n")
     r = hook("pre", py_project, target)
     assert r.returncode == 2
-    assert "verification.md has not been approved" in r.stderr
-    run_cli(py_project, "approve", "verification")
-    r = hook("pre", py_project, target)  # formal still "undecided"
+    assert "design/api.md or one of its artifacts changed" in r.stderr
+    assert run_cli(py_project, "revise", "api", "--from", "oo", "contract tweak").returncode == 0
+    approve(py_project, "api")
+    r = hook("pre", py_project, target)  # later docs were approved against the old API contract
     assert r.returncode == 2
-    assert "formal:" in r.stderr
+    assert "design/oo.md was approved before design/api.md (R-1: contract tweak) changed" in r.stderr
+    r = run_cli(py_project, "approve", "data")  # data comes first: oo waits until data is re-confirmed
+    assert r.returncode != 0
+    assert "git diff -- " in r.stderr
+    assert ("design/api" if as_dir else "design/api/openapi.yaml") in r.stderr  # the hint names the artifacts too
+    approve(py_project, "data --yes", "oo --yes")
+    assert hook("pre", py_project, target).returncode == 0
+
+
+def test_approval_loop_back_from_later_phase(py_project: Path) -> None:
+    spec_dir = approve_all(py_project)
+    target = edit(py_project, "src/sample/dedup.py")
+    assert hook("pre", py_project, target).returncode == 0
+
+    # OO design discovers the architecture needs a change: reopen it, with a reason.
+    r = run_cli(py_project, "revise", "architecture", "--from", "oo", "need a cache | per tenant")
+    assert r.returncode == 0
+    assert "R-1 opened" in r.stdout
+    assert factory.State.load(py_project).extra["stage"] == "architecture"
+    rev = factory.open_revisions(spec_dir)
+    assert [(x["id"], x["doc"], x["from"], x["reason"]) for x in rev] == [
+        ("R-1", "design/architecture.md", "oo", "need a cache / per tenant")
+    ]
+    r = hook("pre", py_project, target)  # blocked as soon as the revision is open, before any edit
+    assert r.returncode == 2
+    assert "revision R-1 on design/architecture.md is open" in r.stderr
+    assert "R-1" in run_cli(py_project, "status").stdout
+
+    arch = spec_dir / "design/architecture.md"
+    arch.write_text(arch.read_text() + "\nper-tenant cache\n")
+    r = run_cli(py_project, "approve", "architecture")
+    assert r.returncode == 0, r.stderr
+    assert "closes R-1" in r.stdout
+    assert "design/api.md" in r.stdout  # later docs need re-confirmation
+    assert not factory.open_revisions(spec_dir)
+    assert "closed" in (spec_dir / "revisions.md").read_text()
+
+    # Re-confirming an unchanged later doc shows what changed upstream and needs an explicit --yes.
+    r = run_cli(py_project, "approve", "api")
+    assert r.returncode != 0
+    assert "design/architecture.md (R-1: need a cache / per tenant)" in r.stderr
+    assert "git diff -- " in r.stderr
+    r = run_cli(py_project, "approve", "api", "--yes")
+    assert r.returncode == 0
+    assert "re-confirmed" in r.stdout
+    assert hook("pre", py_project, target).returncode == 2  # data and oo still stale
+    approve(py_project, "data --yes", "oo --yes")
+    assert hook("pre", py_project, target).returncode == 0
+
+
+def test_changed_approved_doc_needs_a_revision(py_project: Path) -> None:
+    spec_dir = approve_all(py_project)
+    oo = spec_dir / "design/oo.md"
+    oo.write_text(oo.read_text() + "\nsilent change\n")
+    r = run_cli(py_project, "approve", "oo")
+    assert r.returncode != 0
+    assert "no revision is open" in r.stderr
+    assert run_cli(py_project, "revise", "oo", "--from", "tdd", "split the processor").returncode == 0
+    approve(py_project, "oo")
+
+
+def test_spec_change_loops_through_everything(py_project: Path) -> None:
+    spec_dir = approve_all(py_project)
+    assert run_cli(py_project, "revise", "spec", "--from", "data", "AC-1 is infeasible").returncode == 0
+    assert factory.State.load(py_project).extra["stage"] == "spec"
+    spec = spec_dir / "spec.md"
+    spec.write_text(spec.read_text() + "\nclarified AC-1\n")
+    r = run_cli(py_project, "approve", "spec")
+    assert r.returncode == 0
+    assert "later documents to re-confirm" in r.stdout
+    assert "verification.md" in r.stdout
+    r = hook("pre", py_project, edit(py_project, "src/sample/dedup.py"))
+    assert r.returncode == 2
+    assert "verification.md was approved before spec.md (R-1: AC-1 is infeasible) changed" in r.stderr
+    approve(py_project, *[f"{d} --yes" for d in CHAIN[1:]])
+    assert hook("pre", py_project, edit(py_project, "src/sample/dedup.py")).returncode == 0
+
+
+def test_later_docs_wait_for_open_upstream_revision(py_project: Path) -> None:
+    approve_all(py_project)
+    assert run_cli(py_project, "revise", "api", "--from", "oo", "rename op").returncode == 0
+    r = run_cli(py_project, "approve", "oo", "--yes")
+    assert r.returncode != 0
+    assert "revision R-1 on design/api.md is still open" in r.stderr
+
+
+def test_revise_needs_an_approved_doc(py_project: Path) -> None:
+    new_feature(py_project)
+    r = run_cli(py_project, "revise", "api", "--from", "oo", "x")
+    assert r.returncode != 0
+    assert "just edit it" in r.stderr
+
+
+def test_new_creates_design_docs(py_project: Path) -> None:
+    spec_dir = new_feature(py_project)
+    for name in factory.DESIGN_DOCS:
+        assert factory.frontmatter(spec_dir / name)["applies"] == "undecided"
+    r = run_cli(py_project, "status")
+    assert "design/oo.md" in r.stdout
+    assert "`applies:` must be `yes` or `no`" in r.stdout
 
 
 def test_guard_allows_prod_edit_once_approved(py_project: Path) -> None:
@@ -186,6 +403,9 @@ def test_spike_mode_disables_guard_loudly(py_project: Path) -> None:
     "command",
     [
         ".factory/factory approve verification",
+        ".factory/factory approve oo",
+        ".factory/factory approve oo --yes",
+        "cd x && .factory/factory status; .factory/factory approve spec",
         "python3 /x/scripts/factory.py approve spec",
         ".factory/factory spike",
         "echo '{}' > .factory/approvals.json",
@@ -196,7 +416,15 @@ def test_claude_cannot_self_approve(py_project: Path, command: str) -> None:
     assert r.returncode == 2
 
 
-@pytest.mark.parametrize("command", [".factory/factory status", "pytest -q", "cat .factory/approvals.json"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        ".factory/factory status",
+        "pytest -q",
+        "cat .factory/approvals.json",
+        '.factory/factory revise api --from oo "approve flow needs a bulk operation"',
+    ],
+)
 def test_harmless_bash_allowed(py_project: Path, command: str) -> None:
     assert hook("pre", py_project, {"tool_name": "Bash", "tool_input": {"command": command}}).returncode == 0
 
@@ -374,7 +602,30 @@ def test_evidence_check(py_project: Path) -> None:
     assert "V-02" in msg
     assert "V-01" not in msg
     ev.write_text(ev.read_text().replace("| V-02 | FAIL |", "| V-02 | ACCEPTED-RISK |"))
+    ok, msg = factory.evidence_check(spec_dir)
+    assert not ok  # design-conformance rows of the applicable docs (architecture, oo) still missing
+    assert "DC-ARCH-01" in msg
+    assert "DC-OO-01" in msg
+    ev.write_text(ev.read_text() + "| DC-ARCH-01 | PASS | t | yes |\n| DC-OO-01 | PASS | t | yes |\n")
     assert factory.evidence_check(spec_dir)[0]
+
+
+def test_na_design_docs_contribute_no_dc_rows(py_project: Path) -> None:
+    spec_dir = approve_all(py_project)  # api and data are applies: no, but keep their template DC rows
+    ids = factory.design_conformance_ids(spec_dir)
+    assert ids == ["DC-ARCH-01", "DC-OO-01"]
+
+
+def test_gate_runs_import_linter_when_configured(py_project: Path) -> None:
+    assert "lint-imports" not in [c.name for c in factory.gate_checks(py_project)]
+    pyproject = py_project / "pyproject.toml"
+    pyproject.write_text(pyproject.read_text() + '\n[tool.importlinter]\nroot_package = "sample"\n')
+    checks = {c.name: c for c in factory.gate_checks(py_project)}
+    assert "lint-imports" in checks
+    if checks["lint-imports"].argv is None:  # fails closed when the tool is missing
+        ok, report = factory.run_checks(py_project, [checks["lint-imports"]])
+        assert not ok
+        assert "lint-imports not found" in report
 
 
 def test_stop_gate_enforces_evidence_in_evidence_stage(py_project: Path) -> None:

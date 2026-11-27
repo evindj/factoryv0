@@ -4,10 +4,13 @@
 The hooks and the user CLI both use this one module. It is stdlib-only so it runs anywhere python3 exists.
 
 Workflow per feature (docs/specs/NNNN-slug/):
-  spec.md -> verification.md -> [formal/] -> TDD -> evidence.md
+  spec.md -> verification.md (spec-only V-rows)
+          -> design/architecture.md -> design/api.md -> design/data.md -> design/oo.md (each with DC-rows)
+          -> [formal/] -> TDD -> evidence.md
 
-Approvals are recorded by the *human* (`.factory/factory approve <doc>`) as a
-sha256 of the document. Editing an approved document invalidates its approval.
+Approvals are recorded by the *human* (`.factory/factory approve <doc>`), in chain order, as a
+sha256 of the document plus its declared `artifacts:`. Editing an approved document or artifact
+invalidates its approval; re-approving an earlier document invalidates every later one.
 Claude is blocked by hooks from writing approvals itself.
 """
 
@@ -102,6 +105,101 @@ def load_approvals(root: Path) -> dict[str, Any]:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+# Approval chain, in order. Each document can only be approved once every earlier one is approved.
+DOC_CHAIN = (
+    "spec.md",
+    "verification.md",
+    "design/architecture.md",
+    "design/api.md",
+    "design/data.md",
+    "design/oo.md",
+)
+DOC_NAMES = {Path(d).stem: d for d in DOC_CHAIN}
+STAGES = [
+    "spec",
+    "verify-design",
+    "architecture",
+    "api",
+    "data",
+    "oo",
+    "formal",
+    "tdd",
+    "evidence",
+    "done",
+]  # spec, verification, architecture, api, data, oo
+DESIGN_DOCS = tuple(d for d in DOC_CHAIN if d.startswith("design/"))
+ARTIFACT_REQUIRED = ("design/api.md", "design/data.md")
+
+
+def chain_position(doc: Path) -> tuple[Path, int] | None:
+    """(spec_dir, index in DOC_CHAIN) for a chain document, else None."""
+    posix = doc.as_posix()
+    for i, name in enumerate(DOC_CHAIN):
+        if posix.endswith("/" + name):
+            return Path(posix[: -len(name) - 1]), i
+    return None
+
+
+def artifact_paths(doc: Path) -> list[Path]:
+    """Artifacts a design doc declares (`artifacts: a, b`), relative to the feature directory."""
+    pos = chain_position(doc)
+    raw = frontmatter(doc).get("artifacts", "")
+    if not pos or not raw:
+        return []
+    return [pos[0] / a.strip() for a in raw.split(",") if a.strip()]
+
+
+def approval_digest(doc: Path) -> str:
+    """sha256 of the doc, or of the doc plus every artifact file it declares."""
+    arts = artifact_paths(doc)
+    if not arts:
+        return sha256(doc)
+    h = hashlib.sha256(b"doc\0" + sha256(doc).encode())
+    for art in arts:
+        if not art.exists():
+            h.update(b"\0missing\0" + art.name.encode())
+            continue
+        files = sorted(f for f in art.rglob("*") if f.is_file()) if art.is_dir() else [art]
+        for f in files:
+            h.update(b"\0" + f.relative_to(art.parent).as_posix().encode() + b"\0" + sha256(f).encode())
+    return h.hexdigest()
+
+
+def upstream_digests(root: Path, doc: Path) -> dict[str, str]:
+    """Current approval digest of every earlier chain document (empty for spec.md / non-chain docs)."""
+    pos = chain_position(doc)
+    if not pos:
+        return {}
+    spec_dir, idx = pos
+    approvals = load_approvals(root)
+    return {
+        name: (approvals.get(str((spec_dir / name).relative_to(root))) or {}).get("sha256", "")
+        for name in DOC_CHAIN[:idx]
+    }
+
+
+def changed_upstream(root: Path, doc: Path) -> list[str]:
+    """Earlier chain documents re-approved since `doc` was approved (it must be re-confirmed)."""
+    rec = load_approvals(root).get(str(doc.relative_to(root))) or {}
+    recorded = rec.get("upstream")
+    if not isinstance(recorded, dict):
+        return []
+    current = upstream_digests(root, doc)
+    return [name for name, digest in current.items() if recorded.get(name) != digest]
+
+
+def describe_upstream_change(root: Path, spec_dir: Path, names: list[str]) -> str:
+    """'design/api.md (R-2: needs bulk get)' for each changed upstream doc, using the revisions it closed."""
+    approvals = load_approvals(root)
+    reasons = {r["id"]: r["reason"] for r in load_revisions(spec_dir)}
+    out = []
+    for name in names:
+        revs = (approvals.get(str((spec_dir / name).relative_to(root))) or {}).get("revisions", [])
+        why = "; ".join(f"{r}: {reasons.get(r, '?')}" for r in revs)
+        out.append(f"{name} ({why})" if why else name)
+    return ", ".join(out)
+
+
 def is_approved(root: Path, doc: Path) -> tuple[bool, str]:
     if not doc.exists():
         return False, f"{doc.relative_to(root)} does not exist"
@@ -109,9 +207,92 @@ def is_approved(root: Path, doc: Path) -> tuple[bool, str]:
     rec = load_approvals(root).get(rel)
     if not rec:
         return False, f"{rel} has not been approved by a human"
-    if rec["sha256"] != sha256(doc):
-        return False, f"{rel} changed after it was approved; it must be re-approved"
+    if rec["sha256"] != approval_digest(doc):
+        what = "or one of its artifacts " if artifact_paths(doc) else ""
+        return False, f"{rel} {what}changed after it was approved; it must be re-approved"
+    changed = changed_upstream(root, doc)
+    if changed:
+        pos = chain_position(doc)
+        spec_dir = pos[0] if pos else doc.parent
+        return False, (
+            f"{rel} was approved before {describe_upstream_change(root, spec_dir, changed)} changed; "
+            "the human must re-confirm it"
+        )
     return True, "approved"
+
+
+# --------------------------------------------------------------------------- revisions (the approval loop)
+
+R_ROW = re.compile(r"^R-\d+$")
+REVISIONS = "revisions.md"
+REVISION_KEYS = ("id", "opened", "doc", "from", "reason", "status", "closed")
+
+
+def load_revisions(spec_dir: Path) -> list[dict[str, str]]:
+    rows = table_rows(spec_dir / REVISIONS, R_ROW)
+    return [dict(zip(REVISION_KEYS, [*row, *[""] * len(REVISION_KEYS)], strict=False)) for row in rows]
+
+
+def open_revisions(spec_dir: Path, name: str | None = None) -> list[dict[str, str]]:
+    return [r for r in load_revisions(spec_dir) if r["status"] == "open" and (name is None or r["doc"] == name)]
+
+
+def close_revisions(spec_dir: Path, ids: list[str], digest: str) -> None:
+    doc = spec_dir / REVISIONS
+    lines = doc.read_text().splitlines()
+    for i, line in enumerate(lines):
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if line.lstrip().startswith("|") and cells and cells[0] in ids:
+            cells[5:7] = ["closed", f"approval {digest[:12]}"]
+            lines[i] = "| " + " | ".join(cells) + " |"
+    doc.write_text("\n".join(lines) + "\n")
+
+
+DC_ROW = re.compile(r"^DC-[A-Z]+-\d{2,}$")
+
+
+def table_rows(doc: Path, id_pattern: re.Pattern[str]) -> list[list[str]]:
+    """Markdown table rows (as stripped cells) whose first cell matches id_pattern."""
+    if not doc.exists():
+        return []
+    rows = []
+    for line in doc.read_text().splitlines():
+        if line.lstrip().startswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if cells and id_pattern.fullmatch(cells[0]):
+                rows.append(cells)
+    return rows
+
+
+def doc_problems(spec_dir: Path, name: str) -> list[str]:
+    """Structural problems that make a chain document unapprovable (beyond its approval status)."""
+    doc = spec_dir / name
+    if not doc.exists():
+        return [f"{name} does not exist"]
+    if name not in DESIGN_DOCS:
+        return []
+    fm = frontmatter(doc)
+    problems = []
+    applies = fm.get("applies", "").lower()
+    if name == "design/architecture.md" and fm.get("formal", "").lower() not in ("required", "not-needed"):
+        problems.append(f"{name} frontmatter `formal:` must be `required` or `not-needed`")
+    if applies == "no":
+        if not fm.get("reason"):
+            problems.append(f"{name} says `applies: no` but gives no `reason:`")
+        return problems
+    if applies != "yes":
+        return [*problems, f"{name} frontmatter `applies:` must be `yes` or `no` (with a `reason:`)"]
+    rows = table_rows(doc, DC_ROW)
+    if not rows:
+        problems.append(f"{name} has no DC-* design-conformance rows")
+    if name in ARTIFACT_REQUIRED:
+        arts = artifact_paths(doc)
+        if not arts:
+            problems.append(f"{name} applies but declares no `artifacts:` (e.g. design/api/openapi.yaml)")
+        problems += [f"{name} artifact {a.relative_to(spec_dir)} does not exist" for a in arts if not a.exists()]
+    if name == "design/oo.md" and not any(len(r) > 2 and r[2].lower() == "architecture" for r in rows):
+        problems.append(f"{name} needs at least one DC-OO row with dimension `architecture` (ArchUnit / import-linter)")
+    return problems
 
 
 def frontmatter(doc: Path) -> dict[str, str]:
@@ -198,6 +379,9 @@ def gate_checks(root: Path) -> list[Check]:
             ):
                 base = _py_tool(root, tool)
                 checks.append(Check(name, base + args if base else None, f"{tool} not found (uv, .venv or PATH)"))
+            if uses_import_linter(root):  # architecture rules from the OO / architecture design
+                base = _py_tool(root, "lint-imports")
+                checks.append(Check("lint-imports", base, "lint-imports not found (pip install import-linter)"))
         elif stack == "maven":
             base = _mvn(root)
             checks.append(Check("mvn verify", [*base, "-q", "-B", "verify"] if base else None, "mvn/mvnw not found"))
@@ -205,6 +389,12 @@ def gate_checks(root: Path) -> list[Check]:
             base = _gradle(root)
             checks.append(Check("gradle check", [*base, "-q", "check"] if base else None, "gradle/gradlew not found"))
     return checks
+
+
+def uses_import_linter(root: Path) -> bool:
+    pyproject = root / "pyproject.toml"
+    configured = pyproject.exists() and "[tool.importlinter]" in pyproject.read_text()
+    return configured or (root / ".importlinter").exists()
 
 
 def file_checks(root: Path, file: Path) -> list[Check]:
@@ -387,30 +577,36 @@ def guard_edit(root: Path, file: Path) -> tuple[int, str]:
             "Start one with the `factory` skill (spec -> verification design) or run "
             "`! .factory/factory spike` for throwaway exploration."
         )
-    problems = []
-    for doc in ("spec.md", "verification.md"):
-        ok, why = is_approved(root, state.spec_dir / doc)
+    problems = [
+        f"revision {r['id']} on {r['doc']} is open (from {r['from']}: {r['reason']})"
+        for r in open_revisions(state.spec_dir)
+    ]
+    for name in DOC_CHAIN:
+        ok, why = is_approved(root, state.spec_dir / name)
         if not ok:
             problems.append(why)
     if not problems:
-        fm = frontmatter(state.spec_dir / "verification.md")
-        formal = fm.get("formal", "").lower()
-        if formal == "required":
-            ok, why = formal_passed(state.spec_dir)
-            if not ok:
-                problems.append(why)
-        elif formal != "not-needed":
-            problems.append("verification.md frontmatter `formal:` must be `required` or `not-needed`")
+        for name in DOC_CHAIN:
+            problems += doc_problems(state.spec_dir, name)
+    if not problems and formal_required(state.spec_dir):
+        ok, why = formal_passed(state.spec_dir)
+        if not ok:
+            problems.append(why)
     if problems:
         return BLOCK, (
-            f"[factory] Blocked edit to production code {rel}. The verification gate is not satisfied:\n  - "
+            f"[factory] Blocked edit to production code {rel}. The approval gate is not satisfied:\n  - "
             + "\n  - ".join(problems)
-            + "\nFinish the spec / verification design (and formal spec if required) and ask the human to approve."
+            + "\nFinish the spec, verification design and every design phase (and the formal spec if required),"
+            " then ask the human to approve them in order."
         )
     return OK, ""
 
 
-APPROVE_CMD = re.compile(r"(factory(\.py)?|\.factory/factory)\b.*\b(approve|spike|unspike)\b")
+def formal_required(spec_dir: Path) -> bool:
+    return frontmatter(spec_dir / "design/architecture.md").get("formal", "").lower() == "required"
+
+
+APPROVE_CMD = re.compile(r"(factory(\.py)?|\.factory/factory)['\"]?\s+(approve|spike|unspike)\b")
 
 
 def guard_bash(command: str) -> tuple[int, str]:
@@ -539,21 +735,27 @@ def cmd_hook_stop(_: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- evidence / formal
 
 
-ROW_ID = re.compile(r"\b(V-\d{2,})\b")
+ROW_ID = re.compile(r"\b(V-\d{2,}|DC-[A-Z]+-\d{2,})\b")
+V_ROW = re.compile(r"^V-\d{2,}$")
 EVIDENCE_OK = ("PASS", "ACCEPTED-RISK", "MANUAL-PASS")
 
 
+def _unique(ids: list[str]) -> list[str]:
+    return list(dict.fromkeys(ids))
+
+
 def verification_ids(spec_dir: Path) -> list[str]:
-    doc = spec_dir / "verification.md"
-    if not doc.exists():
-        return []
+    return _unique([r[0] for r in table_rows(spec_dir / "verification.md", V_ROW)])
+
+
+def design_conformance_ids(spec_dir: Path) -> list[str]:
+    """DC-* rows of every design doc that applies (n/a docs contribute none)."""
     ids: list[str] = []
-    for line in doc.read_text().splitlines():
-        if line.lstrip().startswith("|"):
-            m = ROW_ID.search(line.split("|")[1] if line.count("|") > 1 else line)
-            if m and m.group(1) not in ids:
-                ids.append(m.group(1))
-    return ids
+    for name in DESIGN_DOCS:
+        doc = spec_dir / name
+        if frontmatter(doc).get("applies", "").lower() == "yes":
+            ids += [r[0] for r in table_rows(doc, DC_ROW)]
+    return _unique(ids)
 
 
 def evidence_check(spec_dir: Path) -> tuple[bool, str]:
@@ -561,6 +763,7 @@ def evidence_check(spec_dir: Path) -> tuple[bool, str]:
     ev = spec_dir / "evidence.md"
     if not ids:
         return False, f"{spec_dir.name}: verification.md has no V-NN rows"
+    ids += design_conformance_ids(spec_dir)
     if not ev.exists():
         return False, f"{spec_dir.name}: evidence.md missing"
     status: dict[str, str] = {}
@@ -581,13 +784,13 @@ def evidence_check(spec_dir: Path) -> tuple[bool, str]:
         if bad:
             msg += " Not passing: " + ", ".join(bad) + "."
         return False, msg
-    return True, f"{spec_dir.name}: all {len(ids)} verification rows have evidence"
+    return True, f"{spec_dir.name}: all {len(ids)} verification and design-conformance rows have evidence"
 
 
 def formal_passed(spec_dir: Path) -> tuple[bool, str]:
     logs = sorted((spec_dir / "formal").glob("*.model-check.log"))
     if not logs:
-        return False, "verification.md says formal: required, but no model-check log exists in formal/"
+        return False, "design/architecture.md says formal: required, but no model-check log exists in formal/"
     failed = []
     for log in logs:
         # <Spec>.model-check.log or <Spec>.<Cfg>.model-check.log
@@ -718,7 +921,8 @@ def cmd_new(args: argparse.Namespace) -> int:
     slug = re.sub(r"[^a-z0-9]+", "-", args.slug.lower()).strip("-")
     d = specs / f"{(max(nums) + 1) if nums else 1:04d}-{slug}"
     d.mkdir()
-    for name in ("spec.md", "verification.md", "evidence.md"):
+    (d / "design").mkdir()
+    for name in ("spec.md", "verification.md", "evidence.md", REVISIONS, *DESIGN_DOCS):
         (d / name).write_text((TEMPLATES / name).read_text().replace("{{feature}}", args.slug))
     state = State.load(root)
     state.active = str(d.relative_to(root))
@@ -742,17 +946,95 @@ def cmd_approve(args: argparse.Namespace) -> int:
     state = State.load(root)
     if not state.spec_dir:
         sys.exit("no active spec")
-    doc = state.spec_dir / (args.doc if args.doc.endswith(".md") else f"{args.doc}.md")
+    name = DOC_NAMES.get(args.doc.removesuffix(".md").removeprefix("design/"))
+    if not name:
+        sys.exit(f"unknown document {args.doc!r}; approve one of: {', '.join(DOC_NAMES)}")
+    doc = state.spec_dir / name
     if not doc.exists():
         sys.exit(f"{doc} not found")
+    checks = [is_approved(root, state.spec_dir / n) for n in DOC_CHAIN[: DOC_CHAIN.index(name)]]
+    earlier = [why for ok, why in checks if not ok]
+    earlier += [
+        f"revision {r['id']} on {r['doc']} is still open"
+        for n in DOC_CHAIN[: DOC_CHAIN.index(name)]
+        for r in open_revisions(state.spec_dir, n)
+    ]
+    if earlier:
+        sys.exit(f"cannot approve {name} yet; approve the earlier documents first:\n  - " + "\n  - ".join(earlier))
+    problems = doc_problems(state.spec_dir, name)
+    if problems:
+        sys.exit(f"cannot approve {name}:\n  - " + "\n  - ".join(problems))
+    rel = str(doc.relative_to(root))
     approvals = load_approvals(root)
-    approvals[str(doc.relative_to(root))] = {
-        "sha256": sha256(doc),
+    prev = approvals.get(rel)
+    digest = approval_digest(doc)
+    revs = [r["id"] for r in open_revisions(state.spec_dir, name)]
+    if prev and prev["sha256"] != digest and not revs:
+        sys.exit(
+            f"{name} changed since it was approved, but no revision is open for it.\n"
+            "Every change to an approved document needs a recorded reason: "
+            f'`.factory/factory revise {Path(name).stem} --from <stage> "<why>"`, then approve again.'
+        )
+    changed = changed_upstream(root, doc) if prev and prev["sha256"] == digest else []
+    if changed and not args.yes:
+        paths = [state.spec_dir / n for n in changed]
+        paths += [a for n in changed for a in artifact_paths(state.spec_dir / n)]
+        diffs = "  git diff -- " + " ".join(str(x.relative_to(root)) for x in paths)
+        sys.exit(
+            f"{name} is unchanged, but it was approved before these earlier documents changed:\n  "
+            f"{describe_upstream_change(root, state.spec_dir, changed)}\n"
+            f"Review the upstream changes, e.g.\n{diffs}\n"
+            f"then re-confirm that {name} still holds: `.factory/factory approve {Path(name).stem} --yes`"
+        )
+    approvals[rel] = {
+        "sha256": digest,
+        "upstream": upstream_digests(root, doc),
+        "artifacts": [str(a.relative_to(state.spec_dir)) for a in artifact_paths(doc)],
+        "revisions": revs,
         "by": os.environ.get("USER", "human"),
         "at": _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds"),
     }
     approvals_path(root).write_text(json.dumps(approvals, indent=2) + "\n")
-    print(f"approved {doc.relative_to(root)}")
+    if revs:
+        close_revisions(state.spec_dir, revs, digest)
+    verb = "re-confirmed" if changed else "approved"
+    print(f"{verb} {rel}" + (f" (closes {', '.join(revs)})" if revs else ""))
+    later = [
+        n for n in DOC_CHAIN[DOC_CHAIN.index(name) + 1 :] if str((state.spec_dir / n).relative_to(root)) in approvals
+    ]
+    stale = [n for n in later if not is_approved(root, state.spec_dir / n)[0]]
+    if stale:
+        print("later documents to re-confirm (`approve <doc> --yes` after review): " + ", ".join(stale))
+    return 0
+
+
+DOC_STAGE = {"spec": "spec", "verification": "verify-design"}
+
+
+def cmd_revise(args: argparse.Namespace) -> int:
+    """Reopen an approved document (the loop back): records why, and blocks code until it is re-approved."""
+    root = _require_root()
+    state = State.load(root)
+    if not state.spec_dir:
+        sys.exit("no active spec")
+    short = args.doc.removesuffix(".md").removeprefix("design/")
+    name = DOC_NAMES.get(short)
+    if not name:
+        sys.exit(f"unknown document {args.doc!r}; revise one of: {', '.join(DOC_NAMES)}")
+    if str((state.spec_dir / name).relative_to(root)) not in load_approvals(root):
+        sys.exit(f"{name} has not been approved yet; just edit it, no revision needed")
+    log = state.spec_dir / REVISIONS
+    if not log.exists():
+        log.write_text((TEMPLATES / REVISIONS).read_text().replace("{{feature}}", state.spec_dir.name))
+    rid = f"R-{len(load_revisions(state.spec_dir)) + 1}"
+    stamp = _dt.datetime.now(_dt.UTC).isoformat(timespec="seconds")
+    reason = " ".join(args.reason.split()).replace("|", "/")
+    with log.open("a") as f:
+        f.write(f"| {rid} | {stamp} | {name} | {args.source} | {reason} | open | |\n")
+    state.extra["stage"] = DOC_STAGE.get(short, short)
+    state.save()
+    print(f"{rid} opened on {name} (from {args.source}); production code is blocked until it is re-approved.")
+    print(f"stage: {state.extra['stage']}")
     return 0
 
 
@@ -771,12 +1053,18 @@ def cmd_status(_: argparse.Namespace) -> int:
     print(f"root:   {root}\nstacks: {', '.join(detect_stacks(root)) or 'none'}\nmode:   {state.mode}")
     print(f"active: {state.active or '-'}  stage: {state.extra.get('stage', '-')}")
     if state.spec_dir:
-        for doc in ("spec.md", "verification.md"):
-            print(f"  {doc:16} {is_approved(root, state.spec_dir / doc)[1]}")
-        fm = frontmatter(state.spec_dir / "verification.md")
-        if fm.get("formal", "").lower() == "required":
-            print(f"  {'formal':16} {formal_passed(state.spec_dir)[1]}")
-        print(f"  {'evidence':16} {evidence_check(state.spec_dir)[1]}")
+        for name in DOC_CHAIN:
+            doc = state.spec_dir / name
+            applies = frontmatter(doc).get("applies", "") if name in DESIGN_DOCS else ""
+            label = name + (" (n/a)" if applies.lower() == "no" else "")
+            print(f"  {label:30} {is_approved(root, doc)[1]}")
+            for problem in doc_problems(state.spec_dir, name):
+                print(f"  {'':30} ! {problem}")
+        for r in open_revisions(state.spec_dir):
+            print(f"  {'revision ' + r['id']:30} OPEN on {r['doc']} (from {r['from']}): {r['reason']}")
+        if formal_required(state.spec_dir):
+            print(f"  {'formal':30} {formal_passed(state.spec_dir)[1]}")
+        print(f"  {'evidence':30} {evidence_check(state.spec_dir)[1]}")
     return 0
 
 
@@ -834,11 +1122,20 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("slug")
     s.set_defaults(fn=cmd_new)
     s = sub.add_parser("stage", help="record the current stage")
-    s.add_argument("stage", choices=["spec", "verify-design", "formal", "tdd", "evidence", "done"])
+    s.add_argument(
+        "stage",
+        choices=STAGES,
+    )
     s.set_defaults(fn=cmd_stage)
-    s = sub.add_parser("approve", help="(human) approve spec|verification of the active feature")
+    s = sub.add_parser("approve", help="(human) approve spec|verification|architecture|api|data|oo, in that order")
     s.add_argument("doc")
+    s.add_argument("--yes", action="store_true", help="re-confirm an unchanged doc after upstream changes")
     s.set_defaults(fn=cmd_approve)
+    s = sub.add_parser("revise", help="reopen an approved doc with a recorded reason (loops back)")
+    s.add_argument("doc")
+    s.add_argument("--from", dest="source", required=True, choices=STAGES, help="stage that found the problem")
+    s.add_argument("reason")
+    s.set_defaults(fn=cmd_revise)
     s = sub.add_parser("spike", help="(human) toggle spike mode")
     s.add_argument("--off", action="store_true")
     s.set_defaults(fn=cmd_spike)

@@ -1,17 +1,28 @@
 <!-- software-factory -->
 ## Software factory workflow (enforced by hooks)
 
-This project uses the `software-factory` plugin. Feature work always goes through:
+This project uses the `software-factory` plugin. Feature work always goes through these gated stages, each approved by the human in order:
 
-1. **Spec**: `docs/specs/NNNN-slug/spec.md` with testable acceptance criteria. Approved by the human.
-2. **Verification design**: `verification.md`. Brainstorm *every* way each criterion will be proven, then do an adversarial "how could this be wrong and still pass?" pass. Approved by the human.
-3. **Formal spec** (when verification.md says `formal: required`): TLA+/Alloy in `formal/`, model-checked by `.factory/factory model-check`.
-4. **TDD**: each V-row becomes an executable check that is seen failing (`.factory/factory record-red V-NN "<cmd>"`), then passing.
-5. **Evidence**: `evidence.md` maps every V-row to proof. `.factory/factory evidence` must pass.
+1. **Spec**: `docs/specs/NNNN-slug/spec.md` with testable acceptance criteria.
+2. **Verification design**: `verification.md`, derived from the spec only. Brainstorm *every* way each criterion will be proven, then do an adversarial "how could this be wrong and still pass?" pass.
+3. **Design**, one phase at a time, each in `design/` with its own design-conformance checks (`DC-*` rows):
+   1. `architecture.md`: high-level architecture and resiliency (failure modes, timeouts, retries, idempotency), plus the formal-spec decision
+   2. `api.md`: the contract, with a machine-readable artifact (OpenAPI / proto / AsyncAPI / stub)
+   3. `data.md`: persistence design, with a schema/migrations artifact
+   4. `oo.md`: object-oriented design, with ArchUnit / import-linter rules
+
+   A phase that doesn't apply says `applies: no` with a `reason:` and is still approved.
+   After oo, the `design-reviewer` subagent checks that the six documents agree (convergence).
+4. **Formal spec** (when architecture.md says `formal: required`): TLA+/Alloy in `formal/`, model-checked by `.factory/factory model-check`.
+5. **TDD**: each V-row and DC-row becomes an executable check that is seen failing (`.factory/factory record-red <ID> "<cmd>"`), then passing. Code follows the approved design.
+6. **Evidence**: `evidence.md` maps every V-row and DC-row to proof. `.factory/factory evidence` must pass.
 
 Rules:
-- Production code is blocked until spec.md and verification.md are approved. Tests, docs and specs are always editable.
-- You never approve your own work. Ask the user to run `! .factory/factory approve spec` (or `verification`).
+- Production code is blocked until all six documents are approved (spec, verification, architecture, api, data, oo). Tests, docs and specs are always editable.
+- **Approval loop:** when a later stage finds a flaw in an approved document, loop back. Run `.factory/factory revise <doc> --from <stage> "<why>"` (recorded in `revisions.md`; it blocks code). Then fix the doc, and ask the human to re-approve it and re-confirm the later docs (`approve <doc> --yes`). Never work around a flawed earlier decision.
+- Editing an approved document or its artifacts invalidates its approval. Re-approving a changed document needs an open revision.
+- You never approve your own work. Ask the user to run `! .factory/factory approve <spec|verification|architecture|api|data|oo>`.
+- If the code can't follow the design, stop and revise the design document (re-approval). Don't silently diverge.
 - Never weaken a check to make it pass (skipping tests, lowering types, `# type: ignore`, `@Disabled`, deleting assertions) without the user's explicit agreement, which is recorded in evidence.md as ACCEPTED-RISK.
-- `.factory/factory status` shows where the active feature stands. `.factory/factory gate` runs all static checks and tests.
+- `.factory/factory status` shows where the active feature stands. `.factory/factory gate` runs all static checks, architecture rules and tests.
 - Use the `factory` skill to drive the whole flow.
